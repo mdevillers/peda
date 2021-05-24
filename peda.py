@@ -18,12 +18,22 @@ import time
 import signal
 import traceback
 import codecs
+import logging
+
+import capstone
 
 # point to absolute path of peda.py
 PEDAFILE = os.path.abspath(os.path.expanduser(__file__))
 if os.path.islink(PEDAFILE):
     PEDAFILE = os.readlink(PEDAFILE)
 sys.path.insert(0, os.path.dirname(PEDAFILE) + "/lib/")
+
+DEBUGFILE = os.path.join(os.path.dirname(PEDAFILE), "peda_debug.log")
+ERRORFILE = os.path.join(os.path.dirname(PEDAFILE), "peda_error.log")
+logging.basicConfig(level=logging.ERROR,\
+    filename=DEBUGFILE, filemode='w',\
+    format='%(asctime)s [%(levelname)s] %(filename)s:%(lineno)s %(funcName)s() %(message)s', \
+    datefmt='%d-%b-%y %H:%M:%S')
 
 # Use six library to provide Python 2/3 compatibility
 import six
@@ -814,6 +824,22 @@ class PEDA(object):
         return (addr, code)
 
     @memoized
+    def next_inst_code(self, address):
+        """
+        Get next instruction binary code
+
+        Args:
+            - address: address to get next instruction (Int)
+
+        Returns:
+            - code_bin(bytes([hexcodes]))
+        """
+        next_adr = peda.next_inst(address)[0][0]
+        output = self.execute_redirect("x/%dxb %s" % (next_adr - address, hex(address)))
+        hex_array = re.findall(r'0x([0-9a-f]{2})(?:\s|$)',output)
+        return bytes([int(c, 16) for c in hex_array])
+
+    @memoized
     def next_inst(self, address, count=1):
         """
         Get next instructions at an address
@@ -871,6 +897,197 @@ class PEDA(object):
             code = self.execute_redirect("x/%di 0x%x" % (count//2, pc))
 
         return code.rstrip()
+
+    def capstone_disassemble(self, bin_bytes):
+        """
+        Disassemble bytes and builds an tuple array containing the registers
+            and the memory addresses that are affected by the instruction.
+
+        Args:
+            - bin_bytes: instruction byte array (bytes[])
+
+        Returns:
+            array of tuples(idx, 'reg', register_name)
+            or
+            array of tuples(idx, 'mem', <memory_dest>, <memory_src>)
+            or
+            array of tuples(idx, 'memimm', <memory_dest>, <memory_src>)
+            (lea only)
+
+            example for instruction "lea eax,[ebx-0x1984]"
+                [(0, 'reg', 'eax'), (1, 'memimm', '[ebx - 0x1984]', ['ebx'])]
+
+            example for instruction "push DWORD PTR [ebx+0x24]"
+                [(0, 'mem', 'dword ptr [ebx + 0x24]', ['ebx'])]
+
+            example for instruction "mov eax,DWORD PTR [esp]"
+                [(0, 'reg', 'eax'), (1, 'mem', 'dword ptr [esp]', ['esp'])]
+
+        """        
+        try: 
+
+            (arch, bits) = self.getarch()
+
+            if "i386" in arch:
+                md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+            elif "64" in arch:
+                md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+            md.detail = True
+
+            inst = md.disasm(bin_bytes, 0x1000)
+
+            if len(list(inst)) == 0 and "64" in arch:
+                md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+                md.detail = True
+            
+            ret = []
+            for inst in md.disasm(bin_bytes, 0x1000):
+                logging.debug(f'inst mnemonic:{inst.mnemonic} op_str:{inst.op_str}')
+                logging.debug(f'inst operands:{inst.operands}')
+                ope = inst.op_str.split(',')
+                logging.debug(f'ope: {ope}')
+                if inst.mnemonic == 'pop':
+                    if "i386" in arch:
+                        r = (0, 'mem', 'dword ptr [esp]', ['esp'])
+                    elif "64" in arch:
+                        r = (0, 'mem', 'qword ptr [rsp]', ['rsp'])
+                    ret.append(r)
+                if len(inst.operands) > 0:
+                    for i, op in enumerate(inst.operands):
+                        if op.type == capstone.CS_OP_REG:
+                            r = (i, 'reg', inst.reg_name(op.value.reg))
+                            if r[2] not in [(c) for (a,b,c,*d) in ret]:
+                                ret.append(r)
+                        if op.type == capstone.CS_OP_IMM:
+                            # the immediate operands are ignored
+                            # logging.debug(f'--type: CS_OP_IMM')
+                            # logging.debug(f'imm: {op.value.imm}')
+                            pass
+                        if op.type == capstone.CS_OP_MEM:
+                            memreg = []
+                            if op.value.mem.base != 0:
+                                memreg.append(inst.reg_name(op.value.mem.base))
+                            if op.value.mem.index != 0:
+                                memreg.append(inst.reg_name(op.value.mem.index))
+                            if inst.mnemonic == 'lea':
+                                r = (i, 'memimm', ope[i].strip(), memreg)
+                            else:
+                                r = (i, 'mem', ope[i].strip(), memreg)
+                            ret.append(r)
+                        if op.type == capstone.CS_OP_FP:
+                            # the floating-points instructions are ignored
+                            # logging.debug(f'fp: {op.value.fp}')
+                            pass
+
+        except Exception as e:
+            with open (ERRORFILE, 'w') as g:
+                traceback.print_exc(file=g)
+            with open (ERRORFILE, 'r') as f:
+                for l in f:
+                    logging.error(l.rstrip())
+
+        return ret
+
+    def format_context_string(self, inst_bytes):
+        """
+        Builds a string containing the value of the different registers and memory
+        adresses involved in the current instruction.
+
+        Args:
+            inst_bytes: byte[idx, typ, value, memregs] 
+
+        Returns:
+            ret: str - string to display in the code area
+        """
+        try:
+            (arch, bits) = self.getarch()
+            ret = []
+            logging.debug(f"inst_bytes:{inst_bytes}")
+            for c in inst_bytes:
+                idx, typ, value, *memregs = c
+                logging.debug(f"idx:{idx} typ:{typ} value:{value} memregs:{memregs}")
+                if typ == 'reg':
+                    output = self.execute_redirect(f'print ${value}')
+                    if output:
+                        pattern = r'^\$[\da-fA-F]+ = .*(0x[\da-fA-F]+)$'
+                        output = re.findall(pattern, output)[0].rstrip()
+                elif typ in ['mem', 'memimm']:
+                    # direct memory address (no registers)
+                    adr = re.findall(r'\s\[(0x[\da-fA-F]+)\]', value)
+                    if len(adr) > 0:
+                        adr = adr[0]
+                        if 'qword ptr' in value:
+                            output = self.execute_redirect(f'x/xg {adr}')
+                        elif 'dword ptr' in value:
+                            output = self.execute_redirect(f'x/xw {adr}')
+                        elif 'word ptr' in value:
+                            output = self.execute_redirect(f'x/xh {adr}')
+                        elif 'byte ptr' in value:
+                            output = self.execute_redirect(f'x/xb {adr}')
+                        else:
+                            if "i386" in arch:
+                                output = self.execute_redirect(f'x/xw {adr}')
+                            elif "64" in arch:
+                                output = self.execute_redirect(f'x/xg {adr}')
+                        r = re.findall(r':\ s+(0x[\da-fA-F]+)', output)
+                        if len(r) > 0:
+                            output = r[0]
+                    if memregs:
+                        # memory address and register
+                        memregs = memregs[0]
+                        exp = re.findall(r'(?<!:)\[(.*)\]', value)
+                        if len(exp) > 0:
+                            exp = exp[0]
+                            for reg in memregs:
+                                exp = exp.replace(reg, "$" + reg)
+                        output = ""
+                        if exp:
+                            output = self.execute_redirect(f'print {exp}')
+                            if output:
+                                pattern = r'^\$[\da-fA-F]+ .*(0x[\da-fA-F]+).*$'
+                                adr = re.findall(pattern, output)[0].rstrip()
+                                if typ == 'memimm':
+                                    output = adr
+                                    r = re.findall(r'^\[(.*)\]$', value)
+                                    if len(r) > 0:
+                                        value = r[0]
+                                else:
+                                    adr = int(adr, 16)
+                                    if 'qword ptr' in value:
+                                        output = self.execute_redirect(f'x/xg {adr}')
+                                    elif 'dword ptr' in value:
+                                        output = self.execute_redirect(f'x/xw {adr}')
+                                    elif 'word ptr' in value:
+                                        output = self.execute_redirect(f'x/xh {adr}')
+                                    elif 'byte ptr' in value:
+                                        output = self.execute_redirect(f'x/xb {adr}')
+                                    else:
+                                        if "i386" in arch:
+                                            output = self.execute_redirect(f'x/xw {adr}')
+                                        elif "64" in arch:
+                                            output = self.execute_redirect(f'x/xg {adr}')
+                                    output = re.findall(r':\s+(0x[\da-fA-F]+)', output)[0]
+                if output and value:
+                    if int(output, 16) == 0:
+                        output = "0x00"
+                    else:
+                        output = hex(int(output, 16))
+                    value=value.replace(" + ", "+")
+                    value=value.replace(" - ", "-")
+                    if output.strip() != value.strip():
+                        s = f'{value.strip()}:{output.strip()}  '
+                        if s not in ret:
+                            logging.debug(f"s:{s}")
+                            ret.append(s)
+
+        except Exception as e:
+            with open (ERRORFILE, 'w') as g:
+                traceback.print_exc(file=g)
+            with open (ERRORFILE, 'r') as f:
+                for l in f:
+                    logging.error(l.rstrip())  
+        
+        return "".join(ret)
 
     @memoized
     def xrefs(self, search="", filename=None):
@@ -4320,6 +4537,17 @@ class PEDACmd(object):
             else:
                 text += peda.disassemble_around(pc, count)
                 msg(format_disasm_code(text, pc))
+
+                nextcode_bin = peda.next_inst_code(pc)
+                
+                # disassemble next instruction and returns a tuple
+                # containing the registers and memory addresses affected by 
+                # the instruction
+                inst_bytes = peda.capstone_disassemble(nextcode_bin)
+                
+                # builds a string for the code area
+                msg(peda.format_context_string(inst_bytes))
+
         else: # invalid $PC
             msg("Invalid $PC address: 0x%x" % pc, "red")
 
