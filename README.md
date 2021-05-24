@@ -17,6 +17,6 @@ clone of repository https://github.com/longId/peda.git
 
 ## Screenshots
 
-![x86](https://raw.githubusercontent.com/mdevillers/peda/master/resources/images/x86.png)
+![x86](https://raw.githubusercontent.com/mdevillers/peda/master/resources/img/screenshot_x86.png)
 
-![x86_64](https://raw.githubusercontent.com/mdevillers/peda/master/resources/images/x86_64.png)
+![x86_64](https://raw.githubusercontent.com/mdevillers/peda/master/resources/img/screenshot_x86_64.png)
