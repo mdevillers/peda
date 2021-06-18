@@ -5,7 +5,7 @@ PEDA - Python Exploit Development Assistance for GDB
 
 clone of repository https://github.com/longId/peda.git
 
-**Added in this repo**: display values of registers and memory affected on the current line (like OllyDBG or x64dbg)
+**Added in this repo**: display values of registers and memory affected on the current instruction (like OllyDBG or x64dbg)
 
 ## Installation
 
